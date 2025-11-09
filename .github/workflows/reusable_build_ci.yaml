@@ -1,0 +1,151 @@
+name: build-scan-push (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      acr_name:
+        description: "Azure Container Registry name"
+        type: string
+        required: true
+      image_name:
+        description: "Docker image name (e.g., eduhub-video-service)"
+        type: string
+        required: true
+      dockerfile_path:
+        description: "Path to the Dockerfile context (e.g., . or ./path)"
+        type: string
+        required: true
+      push_latest:
+        description: "Also tag and push :latest"
+        type: boolean
+        default: true
+      fail_on_vuln:
+        description: "Fail build on HIGH/CRITICAL vulns"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write           # required for Azure OIDC login (no long-lived secrets)
+  security-events: write    # to upload SARIF to GitHub Security
+
+jobs:
+  build-scan-push:
+    runs-on: ubuntu-latest
+    env:
+      ACR_NAME: ${{ inputs.acr_name }}
+      REGISTRY: ${{ inputs.acr_name }}.azurecr.io
+      IMAGE_NAME: ${{ inputs.image_name }}
+      DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+
+      - name: Log in to ACR (docker)
+        run: az acr login --name "${ACR_NAME}"
+
+      - name: Compute image tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            TAG="pr-${{ github.event.pull_request.number }}-${GITHUB_SHA::7}"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            TAG="v1.${{ github.run_number }}.${GITHUB_SHA::7}"
+          else
+            # e.g. develop or feature branches
+            SAFE_BRANCH="${GITHUB_REF_NAME//\//-}"
+            TAG="${SAFE_BRANCH}-${GITHUB_SHA::7}"
+          fi
+
+          echo "TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "FULL_IMAGE=${REGISTRY}/${IMAGE_NAME}:${TAG}" >> $GITHUB_OUTPUT
+          echo "LATEST_IMAGE=${REGISTRY}/${IMAGE_NAME}:latest" >> $GITHUB_OUTPUT
+
+      - name: Docker metadata (labels/tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.tag.outputs.TAG }}
+            type=raw,value=latest,enable=${{ inputs.push_latest }}
+
+      - name: Build image (no push yet)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.DOCKERFILE_PATH }}
+          file: ${{ env.DOCKERFILE_PATH }}/Dockerfile
+          platforms: linux/amd64
+          load: true                         # load to local Docker daemon so Trivy can scan it
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy scan SARIF
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.tag.outputs.FULL_IMAGE }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          vuln-type: os,library
+          ignore-unfixed: true
+
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Trivy scan → table (fail gate)
+        if: ${{ inputs.fail_on_vuln }}
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.tag.outputs.FULL_IMAGE }}
+          format: table
+          severity: CRITICAL,HIGH
+          vuln-type: os,library
+          exit-code: '1'
+          ignore-unfixed: true
+
+      - name: Push images
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.DOCKERFILE_PATH }}
+          file: ${{ env.DOCKERFILE_PATH }}/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "## Container Build Summary"
+            echo ""
+            echo "- **Registry:** \`${{ env.REGISTRY }}\`"
+            echo "- **Image:** \`${{ env.IMAGE_NAME }}\`"
+            echo "- **Tag:** \`${{ steps.tag.outputs.TAG }}\`"
+            echo "- **Full:** \`${{ steps.tag.outputs.FULL_IMAGE }}\`"
+          } >> $GITHUB_STEP_SUMMARY
