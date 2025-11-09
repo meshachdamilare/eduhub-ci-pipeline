@@ -26,8 +26,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write           # required for Azure OIDC login (no long-lived secrets)
-  security-events: write    # to upload SARIF to GitHub Security
+  security-events: write
 
 jobs:
   build-scan-push:
@@ -49,15 +48,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Azure login (OIDC)
-        uses: azure/login@v2
-        with:
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-
-      - name: Log in to ACR (docker)
-        run: az acr login --name "${ACR_NAME}"
+      # --- Docker login using ACR admin user ----
+      - name: Docker login (ACR admin user)
+        run: |
+          echo "${{ secrets.ACR_PASSWORD }}" | docker login "${REGISTRY}" \
+            -u "${{ secrets.ACR_USERNAME }}" --password-stdin
 
       - name: Compute image tag
         id: tag
@@ -68,7 +63,6 @@ jobs:
           elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
             TAG="v1.${{ github.run_number }}.${GITHUB_SHA::7}"
           else
-            # e.g. develop or feature branches
             SAFE_BRANCH="${GITHUB_REF_NAME//\//-}"
             TAG="${SAFE_BRANCH}-${GITHUB_SHA::7}"
           fi
@@ -91,9 +85,9 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: ${{ env.DOCKERFILE_PATH }}
-          file: ${{ env.DOCKERFILE_PATH }}/Dockerfile
+          file: ${{ env.DOERFILE_PATH }}/Dockerfile
           platforms: linux/amd64
-          load: true                         # load to local Docker daemon so Trivy can scan it
+          load: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
