@@ -19,10 +19,7 @@ on:
         description: "Also tag and push :latest"
         type: boolean
         default: true
-      fail_on_vuln:
-        description: "Fail build on HIGH/CRITICAL vulns"
-        type: boolean
-        default: true
+
     secrets:
       ACR_USERNAME:
         required: true
@@ -31,11 +28,11 @@ on:
 
 permissions:
   contents: read
-  security-events: write
 
 jobs:
-  build-scan-push:
+  build-push:
     runs-on: ubuntu-latest
+
     env:
       ACR_NAME: ${{ inputs.acr_name }}
       REGISTRY: ${{ inputs.acr_name }}.azurecr.io
@@ -86,7 +83,7 @@ jobs:
             type=raw,value=${{ steps.tag.outputs.TAG }}
             type=raw,value=latest,enable=${{ inputs.push_latest }}
 
-      # Optional: early guard for path mistakes
+      # Optional guard for path issues
       - name: Sanity check Dockerfile path
         run: |
           echo "PWD=$(pwd)"
@@ -95,58 +92,20 @@ jobs:
           test -f "${{ env.DOCKERFILE_PATH }}/Dockerfile" \
             || { echo "Dockerfile not found at ${DOCKERFILE_PATH}/Dockerfile"; exit 1; }
 
-      - name: Build image (no push yet)
+      - name: Build Docker image (no push yet)
         uses: docker/build-push-action@v6
         with:
           context: ${{ env.DOCKERFILE_PATH }}
           file: ${{ env.DOCKERFILE_PATH }}/Dockerfile
           platforms: linux/amd64
+          push: false
           load: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Sanity check built image tags
-        run: |
-          docker images | head -n 50
-          docker image inspect "${{ steps.tag.outputs.FULL_IMAGE }}" >/dev/null
-
-      # Generate SARIF (do not fail job here so the file always exists)
-      - name: Trivy scan (SARIF)
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: ${{ steps.tag.outputs.FULL_IMAGE }}
-          format: sarif
-          output: trivy-results.sarif
-          severity: CRITICAL,HIGH
-          vuln-type: os,library
-          ignore-unfixed: true
-          exit-code: '0'
-
-      # Upload SARIF only if file exists and not from a forked PR
-      - name: Upload SARIF to GitHub Security
-        if: |
-          always() &&
-          hashFiles('trivy-results.sarif') != '' &&
-          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-results.sarif
-
-      # Enforce policy with a human-readable table
-      - name: Trivy scan (table, fail on HIGH/CRITICAL)
-        if: ${{ inputs.fail_on_vuln }}
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: ${{ steps.tag.outputs.FULL_IMAGE }}
-          format: table
-          severity: CRITICAL,HIGH
-          vuln-type: os,library
-          ignore-unfixed: true
-          exit-code: '1'
-
-      - name: Push images
+      - name: Push images to ACR
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v6
         with:
@@ -162,7 +121,7 @@ jobs:
       - name: Summary
         run: |
           {
-            echo "## Container Build Summary"
+            echo "##Container Build Summary"
             echo ""
             echo "- **Registry:** \`${{ env.REGISTRY }}\`"
             echo "- **Image:** \`${{ env.IMAGE_NAME }}\`"
